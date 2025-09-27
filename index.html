@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Forest Survival (Web)</title>
+  <style>
+    :root{--bg:#001;--btn:#007f00;--btn-hover:#00c000}
+    html,body{height:100%;margin:0;font-family:Segoe UI,Roboto,Arial;overflow:hidden;background:#000}
+    #gameCanvas{display:block;background:#000;width:100vw;height:100vh}
+    /* Simple UI overlays */
+    .overlay{position:absolute;left:50%;transform:translateX(-50%);color:#fff;text-align:center}
+    #startMenu{top:8vh}
+    .menu-btn{display:inline-block;padding:12px 24px;margin:10px;background:var(--btn);border-radius:6px;cursor:pointer}
+    .menu-btn.quit{background:#800}
+    #hud{position:absolute;left:10px;top:10px;color:#fff;text-align:left}
+    #levelSummary,#upgradeMenu,#deathScreen{position:absolute;top:10vh;left:50%;transform:translateX(-50%);background:rgba(10,10,10,0.95);padding:20px;border-radius:10px;color:#fff;display:none;width:320px}
+    .u-btn{background:var(--btn);padding:8px 12px;border-radius:6px;display:inline-block;margin:6px;cursor:pointer}
+    .leaf{position:absolute}
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+<div id="startMenu" class="overlay">
+  <h1 style="color:gold">Forest Survival</h1>
+  <div>
+    <div class="menu-btn" data-level="1">Level 1</div>
+    <div class="menu-btn" data-level="2">Level 2</div>
+    <div class="menu-btn" data-level="3">Level 3</div>
+    <div class="menu-btn" data-level="4">Level 4</div>
+    <div class="menu-btn quit">Quit</div>
+  </div>
+</div>
+<div id="hud"></div>
+<div id="levelSummary"></div>
+<div id="upgradeMenu"></div>
+<div id="deathScreen"></div>
+<script>
+// ----- Config -----
+const CANVAS_W = 800, CANVAS_H = 600;
+const PLAYER_COLOR = '#0066ff';
+const ENEMY_COLORS = {weak:'#c80000', fast:'#ff3232', tank:'#960064', boss:'#640080'};
+const ALTAR_COLOR = '#ff8c00';
+const BUFF_COLOR = '#ffd700';
+const PROJECTILE_COLOR = '#ffff00';
+const FOG_ALPHA = 0.35;
+
+// ----- Utilities -----
+function rand(a,b){return Math.random()*(b-a)+a}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+
+// ----- DOM -----
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const startMenu = document.getElementById('startMenu');
+const hud = document.getElementById('hud');
+const levelSummary = document.getElementById('levelSummary');
+const upgradeMenu = document.getElementById('upgradeMenu');
+const deathScreen = document.getElementById('deathScreen');
+
+canvas.width = CANVAS_W; canvas.height = CANVAS_H;
+
+// ----- Audio (procedural) -----
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playTone(freq=440,dur=0.15,volume=0.1,type='sine'){
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type; o.frequency.value = freq; g.gain.value = volume;
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime + dur);
+}
+
+// ----- Game objects -----
+class Player{
+  constructor(){
+    this.pos = {x:CANVAS_W/2,y:CANVAS_H/2};
+    this.health = 100; this.maxHealth = 100; this.souls = 0;
+    this.buffTimer = 0; this.speedBoost = 0; this.enemySlow = 0;
+    this.attackCooldown = 0; this.speed = 5; this.attackPower = 10;
+  }
+}
+class Enemy{
+  constructor(x,y,type='weak',speedMult=1,healthMult=1){
+    this.pos={x,y}; this.type=type; this.alive=true; this.step=0;
+    if(type==='weak'){ this.health = Math.round(20*healthMult); this.speed = 2*speedMult }
+    else if(type==='fast'){ this.health = Math.round(15*healthMult); this.speed = 3*speedMult }
+    else if(type==='tank'){ this.health = Math.round(40*healthMult); this.speed = 1*speedMult }
+    else { this.health = Math.round(200*healthMult); this.speed = 1.5*speedMult }
+    this.shootTimer = rand(1,3);
+  }
+}
+class Projectile{
+  constructor(x,y,dx,dy,damage=15){ this.pos={x,y}; const len=Math.hypot(dx,dy)||1; this.vel={x:dx/len*6,y:dy/len*6}; this.alive=true; this.damage=damage }
+}
+class Altar{ constructor(x,y){ this.pos={x,y} } }
+
+// ----- Globals for current run -----
+let player, enemies, projectiles, altar, leaves, level, totalTime, running, playerTarget;
+let lastTime = 0;
+
+function initLevel(lv){
+  level = lv; player = new Player(); playerTarget = {...player.pos};
+  const enemyCount = 5 + lv*2; const speedMult = 1 + (lv-1)*0.3; const healthMult = 1 + (lv-1)*0.5;
+  enemies = [];
+  for(let i=0;i<enemyCount;i++){
+    enemies.push(new Enemy(rand(0,CANVAS_W), rand(0,CANVAS_H), ['weak','fast','tank'][Math.floor(rand(0,3))], speedMult, healthMult));
+  }
+  if(lv===4) enemies.push(new Enemy(rand(0,CANVAS_W), rand(0,CANVAS_H),'boss',1.2,1.5));
+  altar = new Altar(CANVAS_W/2, CANVAS_H/2 + 150);
+  projectiles = [];
+  leaves = new Array(60).fill(0).map(()=>({x:rand(0,CANVAS_W),y:rand(0,CANVAS_H),vel:rand(1,3),angle:rand(0,360),rot:rand(-2,2),color:`rgb(${Math.floor(rand(160,220))},${Math.floor(rand(60,140))},${Math.floor(rand(20,50))})`}));
+  totalTime = 0; running = true; lastTime = performance.now();
+}
+
+// ----- Input -----
+let pointerDown=false; canvas.addEventListener('pointerdown',e=>{ pointerDown=true; playerTarget = getCanvasPos(e); if(audioCtx.state==='suspended') audioCtx.resume(); });
+canvas.addEventListener('pointermove',e=>{ if(pointerDown) playerTarget = getCanvasPos(e) });
+window.addEventListener('pointerup',()=>{ pointerDown=false });
+
+function getCanvasPos(e){ const rect=canvas.getBoundingClientRect(); return {x:(e.clientX-rect.left)*(canvas.width/rect.width), y:(e.clientY-rect.top)*(canvas.height/rect.height)} }
+
+// ----- Drawing helpers -----
+function drawBackground(lv){
+  // simple vertical gradient
+  const g = ctx.createLinearGradient(0,0,0,CANVAS_H);
+  const skyTop = ['#50a0ff','#60b4ff','#2e64c8','#283c64'][lv-1];
+  const skyBottom = ['#406496','#7898a0','#1e3c78','#142034'][lv-1];
+  g.addColorStop(0,skyTop); g.addColorStop(1,skyBottom);
+  ctx.fillStyle = g; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+  // ground
+  ctx.fillStyle = ['#22551c','#1e5a23','#284619','#143e14'][lv-1]; ctx.fillRect(0,CANVAS_H*0.7,CANVAS_W,CANVAS_H*0.3);
+  // simple trees
+  ctx.fillStyle = ['#228b22','#32a032','#148018','#0f6410'][lv-1];
+  for(let i=0;i<40;i++){ ctx.fillRect(Math.floor(rand(0,CANVAS_W)), Math.floor(rand(CANVAS_H*0.7-50, CANVAS_H*0.7)), 8, 60) }
+}
+
+function drawCharacter(x,y,color,attack=false,buff=false,step=0){
+  if(buff){ ctx.fillStyle = BUFF_COLOR; ctx.beginPath(); ctx.arc(x,y,16,0,Math.PI*2); ctx.fill(); }
+  ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x,y-14,6,0,Math.PI*2); ctx.fill();
+  ctx.fillRect(x-3,y-8,6,16);
+  // arms
+  const swing = attack?Math.sin(performance.now()*0.01*60)*8:0;
+  ctx.fillRect(x-8+swing,y-5,32,3);
+  // legs
+  ctx.beginPath(); ctx.moveTo(x,y+8); ctx.lineTo(x-Math.sin(step/10)*10,y+18); ctx.moveTo(x,y+8); ctx.lineTo(x+Math.sin(step/10)*10,y+18); ctx.strokeStyle=color; ctx.lineWidth=3; ctx.stroke();
+  if(attack){ ctx.beginPath(); ctx.moveTo(x+8,y-5); ctx.lineTo(x+23,y-5); ctx.strokeStyle='#fff'; ctx.lineWidth=3; ctx.stroke(); }
+}
+
+// ----- Game loop -----
+function update(dt){
+  totalTime += dt;
+  // move player
+  const dirx = playerTarget.x - player.pos.x; const diry = playerTarget.y - player.pos.y; const dist = Math.hypot(dirx,diry);
+  if(dist>5){ const m = (player.speed * (dt*60))/1; player.pos.x += dirx/dist*m; player.pos.y += diry/dist*m }
+  player.pos.x = clamp(player.pos.x,10,CANVAS_W-10); player.pos.y = clamp(player.pos.y,10,CANVAS_H-10);
+
+  // attack
+  let attack=false;
+  if(player.attackCooldown<=0){
+    const nearby = enemies.filter(e=>e.alive && Math.hypot(player.pos.x-e.pos.x,player.pos.y-e.pos.y)<50);
+    if(nearby.length){ playTone(600,0.06,0.07); player.attackCooldown = 0.5; attack=true; for(let e of nearby){ e.health -= player.attackPower; if(e.health<=0){ e.alive=false; player.souls += Math.floor(rand(1,4)); playTone(120,0.08,0.08)}}}
+  }
+  player.attackCooldown = Math.max(0, player.attackCooldown - dt);
+
+  // enemies
+  for(let e of enemies){ if(!e.alive) continue; const dx = player.pos.x - e.pos.x; const dy = player.pos.y - e.pos.y; const len = Math.hypot(dx,dy)||1; let speed = e.speed; if(player.enemySlow>0) speed *= 0.5; e.pos.x += dx/len * speed * dt * 60; e.pos.y += dy/len * speed * dt * 60; e.pos.x = clamp(e.pos.x,10,CANVAS_W-10); e.pos.y = clamp(e.pos.y,10,CANVAS_H-10);
+    if((e.type==='tank' || e.type==='boss')){ e.shootTimer -= dt; if(e.shootTimer<=0){ projectiles.push(new Projectile(e.pos.x,e.pos.y, player.pos.x-e.pos.x, player.pos.y-e.pos.y, 20)); e.shootTimer = rand(1,3); playTone(500,0.05,0.04) }}
+    if(e.type!=='tank' && Math.hypot(player.pos.x-e.pos.x,player.pos.y-e.pos.y)<20){ player.health -= 10*dt }
+  }
+
+  // projectiles
+  for(let p of projectiles){ if(!p.alive) continue; p.pos.x += p.vel.x; p.pos.y += p.vel.y; if(Math.hypot(p.pos.x-player.pos.x,p.pos.y-player.pos.y)<10){ player.health -= p.damage; p.alive=false } if(p.pos.x<0||p.pos.x>CANVAS_W||p.pos.y<0||p.pos.y>CANVAS_H) p.alive=false }
+  projectiles = projectiles.filter(p=>p.alive);
+
+  // timers
+  player.buffTimer = Math.max(0, player.buffTimer - dt); player.enemySlow = Math.max(0, player.enemySlow - dt); if(player.speedBoost>0) player.speedBoost = Math.max(0, player.speedBoost - dt);
+
+  // leaves
+  for(let lf of leaves){ lf.y += lf.vel; lf.angle += lf.rot; if(lf.y>CANVAS_H){ lf.y=0; lf.x = rand(0,CANVAS_W) }}
+
+  // death
+  if(player.health<=0){ running=false; showDeath(); }
+
+  // level complete
+  if(enemies.every(e=>!e.alive)){ running=false; showLevelSummary(); }
+}
+
+function draw(){
+  drawBackground(level);
+  // leaves
+  for(let lf of leaves){ ctx.beginPath(); ctx.ellipse(lf.x, lf.y, 6,3, lf.angle*Math.PI/180, 0, Math.PI*2); ctx.fillStyle = lf.color; ctx.fill() }
+  // altar
+  ctx.fillStyle = ALTAR_COLOR; ctx.beginPath(); ctx.arc(altar.pos.x, altar.pos.y, 15,0,Math.PI*2); ctx.fill();
+  // enemies
+  for(let e of enemies){ if(e.alive){ drawCharacter(e.pos.x,e.pos.y, ENEMY_COLORS[e.type] || '#c00', false, false, e.step); const maxH = e.type==='weak'?20: e.type==='fast'?15: e.type==='tank'?40:200; const ratio = Math.max(0,e.health/maxH); ctx.fillStyle='#f00'; ctx.fillRect(e.pos.x-10,e.pos.y-25,20,4); ctx.fillStyle='#0f0'; ctx.fillRect(e.pos.x-10,e.pos.y-25,20*ratio,4) }}
+  // projectiles
+  for(let p of projectiles){ ctx.beginPath(); ctx.arc(p.pos.x,p.pos.y,4,0,Math.PI*2); ctx.fillStyle = PROJECTILE_COLOR; ctx.fill() }
+  // player
+  drawCharacter(player.pos.x, player.pos.y, PLAYER_COLOR, player.attackCooldown>0, player.buffTimer>0,  player.step);
+  // fog
+  ctx.fillStyle = `rgba(50,50,50,${FOG_ALPHA})`; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+  // HUD
+  hud.innerHTML = `<div>Health: ${Math.max(0,Math.floor(player.health))}/${player.maxHealth}</div><div>Souls: ${player.souls}</div><div>Time: ${Math.floor(totalTime)}s</div><div>Enemies: ${enemies.filter(e=>e.alive).length}</div><div>Buff: ${player.buffTimer>0?'Active':'None'}</div>`;
+  // draw touch target
+  ctx.beginPath(); ctx.arc(playerTarget.x, playerTarget.y, 8,0,Math.PI*2); ctx.strokeStyle='#0ff'; ctx.lineWidth=2; ctx.stroke();
+}
+
+function loop(t){ if(!running) return; const dt = Math.min(0.05,(t - lastTime)/1000); lastTime = t; update(dt); draw(); requestAnimationFrame(loop) }
+
+// ----- UI flows -----
+function showStart(){ startMenu.style.display='block'; }
+function hideStart(){ startMenu.style.display='none'; }
+
+function showLevelSummary(){ levelSummary.style.display='block'; levelSummary.innerHTML = `<h2 style="color:#0f0">Level ${level} Complete!</h2><p>Time Survived: ${Math.floor(totalTime)}s</p><p>Enemies Defeated: ${enemies.length}</p><p>Souls Collected: ${player.souls}</p><div class='u-btn' id='toUpg'>Proceed to Upgrades</div>`; document.getElementById('toUpg').onclick = ()=>{ levelSummary.style.display='none'; showUpgrade() } }
+
+function showUpgrade(){ upgradeMenu.style.display='block'; upgradeMenu.innerHTML = `<h3 style="color:gold">Upgrade Menu</h3><div>Health: ${player.maxHealth}</div><div>Attack: ${player.attackPower}</div><div>Speed: ${player.speed}</div><div>Souls: ${player.souls}</div><div><div class='u-btn' data-action='hp'>Upgrade Health (+20) (5)</div><div class='u-btn' data-action='atk'>Upgrade Attack (+5) (5)</div><div class='u-btn' data-action='spd'>Upgrade Speed (+1) (5)</div><div class='u-btn' id='cont'>Continue</div></div>`;
+  upgradeMenu.querySelectorAll('[data-action]').forEach(b=>b.onclick = ()=>{ const a=b.getAttribute('data-action'); if(player.souls<5) return; if(a==='hp'){ player.maxHealth+=20; player.health+=20; player.souls-=5 } else if(a==='atk'){ player.attackPower+=5; player.souls-=5 } else if(a==='spd'){ player.speed+=1; player.souls-=5 } upgradeMenu.innerHTML=''; showUpgrade(); });
+  document.getElementById('cont').onclick = ()=>{ upgradeMenu.style.display='none'; if(level<4) initLevel(level+1); else { showStart(); } startLoop(); }
+}
+
+function showDeath(){ deathScreen.style.display='block'; deathScreen.innerHTML = `<h2 style="color:#f00">You Died</h2><div class='u-btn' id='restart'>Touch to Restart</div>`; document.getElementById('restart').onclick = ()=>{ deathScreen.style.display='none'; initLevel(level); startLoop(); } }
+
+function startLoop(){ running = true; lastTime = performance.now(); requestAnimationFrame(loop) }
+
+// Altar interaction
+canvas.addEventListener('click', (e)=>{
+  const p = getCanvasPos(e); const d = Math.hypot(p.x-altar.pos.x,p.y-altar.pos.y);
+  if(d<50 && player.souls>0){ playTone(200,0.12,0.09); player.buffTimer = 10 + player.souls*0.5; player.speedBoost = player.buffTimer; player.enemySlow = player.buffTimer; player.souls = 0; playTone(800,0.12,0.06); }
+});
+
+// Start menu buttons
+startMenu.querySelectorAll('.menu-btn').forEach(btn=> btn.addEventListener('click', ()=>{
+  if(btn.classList.contains('quit')){ window.close?.(); return }
+  const lv = Number(btn.getAttribute('data-level'))||1; hideStart(); initLevel(lv); startLoop();
+}));
+
+// Begin
+showStart();
+
+</script>
+</body>
+</html>
